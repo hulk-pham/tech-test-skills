@@ -152,7 +152,7 @@ This section highlights the key technical decisions that directly impact perform
 
 ---
 
-### 2.1. Index & Query Alignment (Core Performance)
+### 2.1. Index & Query Alignment
 
 A composite index is designed on:
 
@@ -173,7 +173,7 @@ This index is intentionally aligned with the primary read patterns:
 
 ---
 
-### 2.2. Keyset Pagination (Scalability Under Write Load)
+### 2.2. Keyset Pagination
 
 Instead of offset-based pagination, the system uses keyset pagination with a cursor:
 
@@ -194,29 +194,7 @@ Instead of offset-based pagination, the system uses keyset pagination with a cur
 
 ---
 
-### 2.3. Timezone-safe Aggregation (Correctness)
-
-Chart queries handle timezone explicitly using:
-
-* `AT TIME ZONE` in PostgreSQL
-* Window functions for aggregation
-
-Data is grouped based on the user’s IANA timezone and aggregated by **local calendar day**.
-
-**Additional safeguard:**
-
-* Avoid using `toISOString()` for chart labels
-* Use calendar-based date extraction to prevent UTC shifting issues
-
-**Impact:**
-
-* Ensures correct time-series aggregation across timezones
-* Prevents subtle bugs in global systems
-* Demonstrates production-grade handling of temporal data
-
----
-
-### 2.4. Focused Caching Strategy
+### 2.3. Focused Caching Strategy
 
 Redis is used to cache only **chart responses**, which represent the most expensive read path.
 
@@ -235,7 +213,7 @@ Redis is used to cache only **chart responses**, which represent the most expens
 
 ---
 
-### 2.5. Stateless API & Horizontal Scalability
+### 2.4. Stateless API & Horizontal Scalability
 
 The API is designed to be fully stateless:
 
@@ -250,7 +228,7 @@ The API is designed to be fully stateless:
 
 ---
 
-### 2.6. Kubernetes-ready Deployment (Scalability & Resilience)
+### 2.5. Kubernetes-ready Deployment
 
 The service is designed to be deployable in containerized environments such as Kubernetes.
 
@@ -267,7 +245,7 @@ The service is designed to be deployable in containerized environments such as K
 
 ---
 
-### 2.7. Optimized JSON Serialization (Runtime Performance)
+### 2.6. Optimized JSON Serialization
 
 For high-throughput endpoints, the system optimizes JSON serialization using **fast-json-stringify**.
 
@@ -289,7 +267,7 @@ For high-throughput endpoints, the system optimizes JSON serialization using **f
 
 ---
 
-### 2.8. Testing Strategy & CI/CD Readiness (Reliability)
+### 2.7. Testing Strategy & CI/CD Readiness
 
 The system includes both **unit tests** and **end-to-end (E2E) tests**.
 
@@ -312,7 +290,7 @@ The system includes both **unit tests** and **end-to-end (E2E) tests**.
 
 ---
 
-### 2.9. Layered Architecture (Maintainability & Separation of Concerns)
+### 2.8. Layered Architecture (Maintainability & Separation of Concerns)
 
 The system follows an **n-layer (clean) architecture**:
 
