@@ -2,33 +2,16 @@
 
 This document describes the **overall design**, **key technical details**, and **trade-offs / assumptions** of the NestJS service for Distance and Temperature metrics (PostgreSQL, TypeORM).
 
-## Quick start (local, without Kubernetes)
+## 1. System design
 
-1. Run **PostgreSQL** (optional **Redis** for chart cache). Set `DATABASE_URL` in `.env` (see `k8s/postgres.yaml` / `k8s/secret.example.yaml` for example credentials).
-2. `cp .env.example .env` — adjust variables.
-3. `npm install` && `npm run start:dev`
-4. **Swagger:** `http://localhost:3000/api` · **Health:** `GET /health` → `200` + `{ "status": "ok" }` (no DB check).
-5. First-time DB: if `TYPEORM_MIGRATIONS_RUN` is not enabled, run `npm run migration:run`.
+### 1.1. Architecture overview
 
-**Environment (minimal):**
+- **Client** (app, script, gateway) uses HTTP REST.
+- **API** handles validation, unit conversion, pagination, chart queries.
+- **PostgreSQL** is the source of truth for all metric rows.
+- **Redis** (optional) provides cache-aside for the chart endpoint, reducing DB read load for identical query parameters.
+- 
 
-| Variable | Notes |
-|----------|--------|
-| `DATABASE_URL` | PostgreSQL connection string (required to run the app) |
-| `REDIS_URL` | Optional — enables cache for `GET /metrics/chart` |
-| `TYPEORM_SYNC` | `true` only for dev; prefer migrations in production |
-| `TYPEORM_MIGRATIONS_RUN` | `true` runs migrations on app boot (e.g. E2E) |
-| `PORT` | Default `3000` |
-
-**Tests:** `npm test` · E2E: `export DATABASE_URL=...` then `npm run test:e2e`.
-
----
-
-## Architecture overview
-
-### Logical diagram (client → API → persistence)
-
-Primary data flow: clients call REST; the API reads/writes PostgreSQL; Redis participates only when chart endpoint caching is enabled.
 
 ```mermaid
 flowchart TB
@@ -45,7 +28,8 @@ flowchart TB
   API -.->|SETEX / SCAN+DEL\nwhen REDIS_URL is set| R
 ```
 
-### Kubernetes deployment diagram (namespace `metrics`)
+
+Default deployment path in this repo: **Kubernetes** (namespace `metrics`) with PostgreSQL and Redis in-cluster, or managed services outside the cluster; **HPA** (`k8s/hpa.yaml`) scales the API Deployment on CPU/memory when Metrics Server is available.
 
 Default manifests under `k8s/`: Kustomize bundles namespace, PostgreSQL (PVC), Redis, API ConfigMap/Secret, Deployment + Service, and HPA. Apply `metrics-api-secret` separately (not included in Kustomize).
 
@@ -75,81 +59,6 @@ flowchart TB
   U["Users / CI"] -->|kubectl port-forward or Ingress| SVC_API
 ```
 
-**Deployment note:** In production you may replace in-cluster PostgreSQL/Redis with managed services; then remove the corresponding entries from `kustomization.yaml` and adjust the API Secret plus (if needed) `initContainers` in `deployment.yaml`. For cluster apply: `cp k8s/secret.example.yaml k8s/secret.yaml`, edit, `kubectl apply -f k8s/secret.yaml`, then `kubectl apply -k k8s/`. Access: `kubectl port-forward -n metrics svc/metrics-api 8080:80` → Swagger at `http://localhost:8080/api`. Image: `docker build -t metrics-api:latest .` (with minikube: `eval $(minikube docker-env)` before build). HPA needs Metrics Server; to disable autoscale for labs, remove `hpa.yaml` from `k8s/kustomization.yaml`.
-
-### Chart read flow with Redis cache (optional)
-
-```mermaid
-sequenceDiagram
-  participant Client
-  participant API as Metrics API
-  participant Redis as Redis
-  participant PG as PostgreSQL
-  Client->>API: GET /metrics/chart?...
-  alt REDIS_URL configured
-    API->>Redis: GET cache key
-    alt cache hit
-      Redis-->>API: JSON chart
-      API-->>Client: 200 + chart
-    else cache miss
-      API->>PG: SQL window function + timezone
-      PG-->>API: rows
-      API->>Redis: SETEX TTL
-      API-->>Client: 200 + chart
-    end
-  else no Redis
-    API->>PG: SQL window function + timezone
-    PG-->>API: rows
-    API-->>Client: 200 + chart
-  end
-```
-
-### Write metric and cache invalidation flow
-
-```mermaid
-sequenceDiagram
-  participant Client
-  participant API as Metrics API
-  participant PG as PostgreSQL
-  participant Redis as Redis
-  Client->>API: POST /metrics
-  API->>PG: INSERT
-  PG-->>API: ok
-  opt REDIS_URL configured
-    API->>Redis: SCAN chart:userId:* → DEL
-  end
-  API-->>Client: 201 Created
-```
-
----
-
-## System components
-
-| Component | Role | Deployment notes |
-|-----------|------|------------------|
-| **HTTP API (NestJS)** | REST: create metric, keyset list, chart by local calendar day + timezone; health for probes; Swagger at `/api`. | Docker image `metrics-api`; container port **3000**; cluster Service **80→3000**. |
-| **PostgreSQL** | Source of truth: `metrics` table, indexes for keyset and chart queries. | In K8s: Deployment `postgres`, Service `postgres-service:5432`, PVC `postgres-pvc`; Secret `postgres-secret`. Can be swapped for RDS/Cloud SQL. |
-| **Redis** | Cache-aside for `GET /metrics/chart`; invalidation by prefix `chart:{userId}:*` after POST. | In K8s: Deployment `redis`, Service `redis-service:6379`. **Optional** — omit `REDIS_URL` and the API skips caching. |
-| **Kubernetes** | Schedules Pods, Services, Secrets, ConfigMaps; HPA scales `metrics-api` on CPU/memory (requires Metrics Server). | `kubectl apply -k k8s/`; namespace `metrics`. [`k8s/hpa.yaml`](k8s/hpa.yaml): min 1, max 10 replicas. |
-| **ConfigMap / Secret (API)** | Non-sensitive env vs `DATABASE_URL`, `REDIS_URL`, etc. | `metrics-api-config` + `metrics-api-secret` (from `secret.example.yaml`). |
-| **Client / Gateway** | Calls the API; an API gateway or BFF may sit in front (auth is out of scope for this repo). | Port-forward: `kubectl port-forward -n metrics svc/metrics-api 8080:80`. |
-
-**Main application dependencies:** NestJS, TypeORM, `pg` driver, Redis client (see `package.json`), validation & Swagger.
-
-**TypeORM CLI:** `npm run migration:run` · `npm run migration:show` · `npm run migration:revert` — DataSource: `src/database/data-source.ts`.
-
----
-
-## 1. System design
-
-### 1.1. Context
-
-- **Client** (app, script, gateway) uses HTTP REST.
-- **API** handles validation, unit conversion, pagination, chart queries.
-- **PostgreSQL** is the source of truth for all metric rows.
-- **Redis** (optional) provides cache-aside for the chart endpoint, reducing DB read load for identical query parameters.
-
-Default deployment path in this repo: **Kubernetes** (namespace `metrics`) with PostgreSQL and Redis in-cluster, or managed services outside the cluster; **HPA** (`k8s/hpa.yaml`) scales the API Deployment on CPU/memory when Metrics Server is available.
 
 ### 1.2. Application layering
 
@@ -185,8 +94,49 @@ erDiagram
 ### 1.4. API behavior (design level)
 
 - **POST `/metrics`:** creates a row; after persist **invalidates** all chart cache for that `userId` when Redis is enabled.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant API as Metrics API
+  participant PG as PostgreSQL
+  participant Redis as Redis
+  Client->>API: POST /metrics
+  API->>PG: INSERT
+  PG-->>API: ok
+  opt REDIS_URL configured
+    API->>Redis: SCAN chart:userId:* → DEL
+  end
+  API-->>Client: 201 Created
+```
+
 - **GET `/metrics`:** filters by `userId`, `type`; **keyset pagination**; optional `targetUnit` for converted values in the response.
 - **GET `/metrics/chart`:** time series with **one point per local calendar day** (IANA `timeZone`) — the **latest record within that day**; window `1m` / `2m`; Redis TTL 120s when caching is on.
+
+```mermaid
+sequenceDiagram
+  participant Client
+  participant API as Metrics API
+  participant Redis as Redis
+  participant PG as PostgreSQL
+  Client->>API: GET /metrics/chart?...
+  alt REDIS_URL configured
+    API->>Redis: GET cache key
+    alt cache hit
+      Redis-->>API: JSON chart
+      API-->>Client: 200 + chart
+    else cache miss
+      API->>PG: SQL window function + timezone
+      PG-->>API: rows
+      API->>Redis: SETEX TTL
+      API-->>Client: 200 + chart
+    end
+  else no Redis
+    API->>PG: SQL window function + timezone
+    PG-->>API: rows
+    API-->>Client: 200 + chart
+  end
+```
 
 **API summary**
 
@@ -196,93 +146,306 @@ erDiagram
 
 ---
 
-## 2. Key implementation details
+## 2. Key Implementation Details
 
-### 2.1. Keyset pagination
-
-- Cursor is **base64url** encoding of JSON `{ t: recordedAt ISO string, i: id }`.
-- Query fetches `limit + 1` rows, ordered `recorded_at DESC`, `id DESC`.
-- Next page: tuple `(recorded_at, id)` is **less than** the cursor tuple (PostgreSQL), stable when many rows share the same `recorded_at`.
-- `limit` is **clamped** to a maximum of 100.
-
-### 2.2. Chart: “latest per local calendar day”
-
-- SQL uses **CTEs** `bounds` / `span` to compute `end_local` (from `endDate` or “today” via `now() AT TIME ZONE tz`) and `start_local` going back `1 month` or `2 months`.
-- **Ranking:** `ROW_NUMBER() OVER (PARTITION BY user_id, type, local_date ORDER BY recorded_at DESC, id DESC)` with `local_date = (recorded_at AT TIME ZONE $tz)::date`.
-- Keep only `rn = 1`, order `local_date ASC`.
-- Because window functions and timezone expressions are required, the repository uses **`DataSource.query`** instead of QueryBuilder alone.
-
-### 2.3. Chart response date formatting
-
-- The PostgreSQL driver may return `date` as a `Date` at **process-local midnight**; the service uses **`getFullYear` / `getMonth` / `getDate`** instead of `toISOString()` to avoid off-by-one days when the host is not UTC.
-
-### 2.4. Unit conversion
-
-- **Distance:** intermediate reference is **meters** (`TO_METERS`).
-- **Temperature:** normalize via **Celsius**, then to target unit.
-- Round to **6 decimal places** after conversion.
-- Unit validation in DTO + service (`unitBelongsToType`).
-
-### 2.5. Redis (chart)
-
-- **Provider** token `REDIS_CLIENT` (`src/common/constants.ts`): if `REDIS_URL` is empty → `null`, service skips cache.
-- Key: `chart:{userId}:{type}:{period}:{timeZone}:{endDate|__auto__}:{targetUnit|__raw__}`.
-- **SETEX** with `CHART_CACHE_TTL_SEC` (default 120s in `src/common/constants.ts`); Redis errors are **swallowed** (fallback to DB).
-- **Invalidation** after `create`: `SCAN` prefix `chart:{userId}:*` then `DEL` (batched).
-
-### 2.6. TypeORM & migrations
-
-- `TYPEORM_SYNC=true` is for dev only; production should use **migrations** (`CreateMetrics1743000000000`).
-- Optionally `TYPEORM_MIGRATIONS_RUN=true` on boot (e.g. E2E) or run `npm run migration:run`.
-
-### 2.7. Health
-
-- `GET /health` returns **200** and `{ status: 'ok' }`, **without** hitting the database — suitable for liveness/readiness when only process liveness matters (add separate DB checks if required).
-
-### 2.8. Validation & API contract
-
-- Global `ValidationPipe`: `whitelist`, `transform`, `enableImplicitConversion`.
-- Swagger at `/api`.
+This section highlights the key technical decisions that directly impact performance, correctness, scalability, and maintainability of the system.
 
 ---
 
-## 3. Trade-offs and assumptions
+### 2.1. Index & Query Alignment (Core Performance)
 
-### 3.1. Trade-offs
+A composite index is designed on:
 
-| Decision | Benefits | Drawbacks / risks |
-|----------|----------|-------------------|
-| **Keyset vs offset** | Stable, efficient at large scale; no “page drift” on inserts. | No “jump to page N”; client must keep the cursor. |
-| **Raw SQL for chart** | Clear timezone + window-function query, full control. | Weaker portability to other DBs; some domain intent lives in SQL. |
-| **Store `value` as decimal → string in entity** | Fewer rounding issues on TypeORM round-trip. | Layers must `Number()` for math; needs discipline. |
-| **Redis cache for chart only** | Offloads the heaviest read; invalidation scoped by user. | TTL 120s: chart can be **stale** up to ~2 minutes unless POST clears cache. |
-| **Invalidate chart via SCAN** | No fixed key enumeration. | SCAN can be slow with very large keyspaces; at scale consider streams, tagged keys, or shorter TTL. |
-| **`userId` is free-form string** | Flexible integration (UUID, internal ids). | No auth in scope — any client knowing `userId` can read/write via the API as implemented. |
+```
+(user_id, type, recorded_at, id)
+```
+
+This index is intentionally aligned with the primary read patterns:
+
+* Filtering by `user_id` and `type`
+* Sorting by `recorded_at DESC, id DESC`
+
+**Impact:**
+
+* Enables PostgreSQL to efficiently serve both listing and chart queries
+* Avoids additional sorting and full table scans
+* Improves query latency under large datasets
+
+---
+
+### 2.2. Keyset Pagination (Scalability Under Write Load)
+
+Instead of offset-based pagination, the system uses keyset pagination with a cursor:
+
+```
+(recorded_at, id)
+```
+
+**Rationale:**
+
+* Offset pagination degrades as data grows
+* Offset is unstable under concurrent inserts
+
+**Impact:**
+
+* Consistent performance regardless of dataset size
+* No pagination drift when new records are inserted
+* Better suitability for high-write workloads
+
+---
+
+### 2.3. Timezone-safe Aggregation (Correctness)
+
+Chart queries handle timezone explicitly using:
+
+* `AT TIME ZONE` in PostgreSQL
+* Window functions for aggregation
+
+Data is grouped based on the user’s IANA timezone and aggregated by **local calendar day**.
+
+**Additional safeguard:**
+
+* Avoid using `toISOString()` for chart labels
+* Use calendar-based date extraction to prevent UTC shifting issues
+
+**Impact:**
+
+* Ensures correct time-series aggregation across timezones
+* Prevents subtle bugs in global systems
+* Demonstrates production-grade handling of temporal data
+
+---
+
+### 2.4. Focused Caching Strategy
+
+Redis is used to cache only **chart responses**, which represent the most expensive read path.
+
+**Design decisions:**
+
+* List endpoints are not cached to reduce complexity
+* Cache key includes all query dimensions (user, type, timezone, etc.)
+* TTL is applied for automatic expiration
+* Cache invalidation is triggered after write operations
+
+**Impact:**
+
+* Significantly reduces database load for repeated queries
+* Keeps cache logic simple and maintainable
+* Achieves high performance with minimal overhead
+
+---
+
+### 2.5. Stateless API & Horizontal Scalability
+
+The API is designed to be fully stateless:
+
+* No in-memory session or shared state
+* External dependencies: PostgreSQL and Redis
+
+**Impact:**
+
+* Enables horizontal scaling across multiple instances
+* Works seamlessly behind a load balancer
+* Simplifies deployment and scaling strategies
+
+---
+
+### 2.6. Kubernetes-ready Deployment (Scalability & Resilience)
+
+The service is designed to be deployable in containerized environments such as Kubernetes.
+
+**Key aspects:**
+
+* Liveness probe via `/health` endpoint
+* Horizontal Pod Autoscaler (HPA) based on CPU or request metrics
+
+**Impact:**
+
+* Self-healing: failed instances are automatically restarted
+* Auto-scaling: adapts to traffic fluctuations
+* Improves overall system availability and resilience
+
+---
+
+### 2.7. Optimized JSON Serialization (Runtime Performance)
+
+For high-throughput endpoints, the system optimizes JSON serialization using **fast-json-stringify**.
+
+**Design decisions:**
+
+* Use **fast-json-stringify** to compile response schemas into optimized serialization functions
+* Apply only to **performance-critical paths** (e.g. chart endpoints with repeated response shapes)
+
+**Rationale:**
+
+* Native `JSON.stringify` is dynamic and incurs overhead for large or frequent responses
+* **fast-json-stringify** improves performance by generating specialized serializers
+
+**Impact:**
+
+* Reduces CPU overhead during serialization
+* Improves response latency under high load
+* Increases throughput for read-heavy endpoints
+
+---
+
+### 2.8. Testing Strategy & CI/CD Readiness (Reliability)
+
+The system includes both **unit tests** and **end-to-end (E2E) tests**.
+
+**Design:**
+
+* Unit tests cover core business logic (validation, unit conversion, query behavior)
+* E2E tests validate full request flows (API → database → response)
+* Tests run in isolation with a dedicated test setup
+
+**CI/CD readiness:**
+
+* Test suite is designed to run automatically in CI pipelines
+* Ensures regressions are detected before deployment
+
+**Impact:**
+
+* Improves reliability and confidence when making changes
+* Enables safe refactoring and continuous delivery
+* Reduces risk of breaking critical functionality
+
+---
+
+### 2.9. Layered Architecture (Maintainability & Separation of Concerns)
+
+The system follows an **n-layer (clean) architecture**:
+
+* Controller layer handles HTTP concerns
+* Service layer contains business logic
+* Data layer manages persistence
+
+**Design principles:**
+
+* Clear separation of concerns
+* Dependency flow from outer layers to inner layers
+* Business logic is isolated from framework-specific details
+
+**Impact:**
+
+* Improves maintainability and readability
+* Makes the system easier to extend and evolve
+* Enhances testability (especially for unit tests)
+* Reduces coupling between application logic and infrastructure
+
+---
+
+## 3. Trade-offs and Assumptions
+
+This section outlines key trade-offs made to balance simplicity, performance, and scalability.
+
+---
+
+### 3.1. Key Trade-offs
+
+**PostgreSQL instead of Time-series database (e.g. InfluxDB)**
+
+* **Benefit:** Keeps the system simple with a single datastore, leveraging relational features (indexes, SQL, transactions)
+* **Trade-off:** Lacks specialized time-series capabilities such as high-ingest optimization, retention policies, and built-in aggregations
+* **Rationale:** PostgreSQL is sufficient for current scale; a time-series DB can be introduced when data volume or ingestion rate grows significantly
+
+---
+
+**Keyset pagination instead of offset**
+
+* **Benefit:** Stable performance and no pagination drift under concurrent writes
+* **Trade-off:** Does not support “jump to page N”; requires cursor-based navigation
+
+---
+
+**Raw SQL for chart queries**
+
+* **Benefit:** Full control over timezone handling and window functions
+* **Trade-off:** Reduced portability and some business logic resides in SQL
+
+---
+
+**Redis caching**
+
+* **Benefit:** Reduces load on the most expensive read path with simple invalidation
+* **Trade-off:** Data may be stale up to TTL (~120s), increase memory usage
+
+---
+
+**Cache invalidation via SCAN**
+
+* **Benefit:** Flexible without maintaining explicit key mappings
+* **Trade-off:** May become inefficient at large scale → alternative strategies (tag-based keys, streams, shorter TTL) may be needed
+
+---
+
+**Composite index vs Write-heavy ingestion**
+
+* **Benefit:** Composite index aligned with read paths keeps list and chart queries efficient without extra moving parts for typical load.
+* **Trade-off:** At very high ingestion rates, index maintenance can become a bottleneck; mitigations include batching writes, reducing indexes where safe, or moving to a time-series optimized database.
+
+---
+
+**Auto-scaling based on CPU utilization**
+
+* **Benefit:** Simple to configure and widely supported (e.g. Kubernetes HPA)
+* **Trade-off:** CPU may not accurately reflect real load, especially for I/O-bound workloads
+* **Rationale:** Sufficient for current service; more advanced metrics (e.g. request rate, latency) can be introduced later
+
+---
 
 ### 3.2. Assumptions
 
-1. **Single PostgreSQL** is enough for the use case; no sharding or read replicas in code.
-2. Client **`recordedAt`** is valid ISO-8601; chart “local day” semantics depend on a valid **IANA timezone** (`Intl.DateTimeFormat` validation).
-3. **No idempotency key** on POST — duplicate calls may create duplicate rows.
-4. **Two metric types** are fixed (Distance, Temperature); new types need domain + migration/constraints if tightened.
-5. **E2E** assumes a real PostgreSQL and `DATABASE_URL`; migrations may run on test boot.
-6. **Redis is optional** — behavior must remain correct without `REDIS_URL`.
-
-### 3.3. Intentionally out of scope (default)
-
-- No message queue (Kafka, etc.), full distributed tracing, or rate limiting.
-- AuthN/AuthZ not in this repo — use a BFF or API gateway if needed.
+* A single PostgreSQL instance is sufficient for current scale
+* Client provides valid ISO-8601 timestamps and IANA timezone
+* No idempotency key is required for current use case
+* Test environment uses a real PostgreSQL instance
+* Redis is optional; system remains correct without caching
 
 ---
 
-## 4. Source reference
+### 3.3. Further Improvements
 
-| Topic | Location |
-|-------|----------|
-| Service (cursor, chart, cache) | `src/metrics/metrics.service.ts` |
-| Repository (keyset + chart SQL) | `src/metrics/metrics-typeorm.repository.ts` |
-| Entity & index | `src/metrics/entities/metric.entity.ts` |
-| Migration | `src/database/migrations/1743000000000-CreateMetrics.ts` |
-| Domain: units, `convertValue`, cursor, timezone, chart dates | `src/common/utils.ts` |
-| Redis provider | `src/metrics/metrics.module.ts` |
-| TypeORM configuration | `src/app.module.ts`, `src/database/typeorm-options.ts` |
+As the system scales, the following enhancements can be considered:
+
+* Database scaling: add read replicas, partitioning, or evaluate a time-series database for high ingestion workloads
+* CQRS: separate read/write paths and precompute aggregations for chart queries
+* Event-driven ingestion: use Kafka to handle high-throughput and decouple processing
+* Observability: introduce distributed tracing to monitor and debug performance
+* Scaling strategy: move beyond CPU-based auto scaling to request rate or latency metrics
+---
+
+## 4. Run projects
+
+### Local (without Kubernetes)
+
+1. Run **PostgreSQL** (optional **Redis** for chart cache). Set `DATABASE_URL` in `.env` (see `k8s/postgres.yaml` / `k8s/secret.example.yaml` for example credentials).
+2. `cp .env.example .env` — adjust variables.
+3. `npm install` && `npm run start:dev`
+4. **Swagger:** `http://localhost:3000/api` · **Health:** `GET /health` → `200` + `{ "status": "ok" }` (no DB check).
+5. First-time DB: if `TYPEORM_MIGRATIONS_RUN` is not enabled, run `npm run migration:run`.
+
+**Environment (minimal):**
+
+| Variable | Notes |
+|----------|--------|
+| `DATABASE_URL` | PostgreSQL connection string (required to run the app) |
+| `REDIS_URL` | Optional — enables cache for `GET /metrics/chart` |
+| `TYPEORM_SYNC` | `true` only for dev; prefer migrations in production |
+| `TYPEORM_MIGRATIONS_RUN` | `true` runs migrations on app boot (e.g. E2E) |
+| `PORT` | Default `3000` |
+
+**Tests:** `npm test` · E2E: `export DATABASE_URL=...` then `npm run test:e2e`.
+
+### Kubernetes (k8s)
+
+Manifests under `k8s/` use **Kustomize** (namespace, Postgres, Redis, API ConfigMap/Deployment/Service, HPA). The API **Secret** is applied separately.
+
+1. Build image: `docker build -t metrics-api:latest .` (minikube: `eval $(minikube docker-env)` before build).
+2. `cp k8s/secret.example.yaml k8s/secret.yaml`, edit values, then `kubectl apply -f k8s/secret.yaml`.
+3. `kubectl apply -k k8s/`.
+4. Access: `kubectl port-forward -n metrics svc/metrics-api 8080:80` → Swagger at `http://localhost:8080/api`.
+
+**Notes:** HPA needs Metrics Server; to disable autoscaling locally, remove `hpa.yaml` from `k8s/kustomization.yaml`. In production you may use managed PostgreSQL/Redis — adjust Secret and manifests accordingly (see **Deployment note** under Architecture).
+
+---
