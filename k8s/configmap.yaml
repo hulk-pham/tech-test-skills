@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: metrics-api-config
+data:
+  PORT: "3000"
+  TYPEORM_SYNC: "false"
+  TYPEORM_MIGRATIONS_RUN: "true"
+  # REDIS_URL bỏ trống hoặc set qua Secret nếu dùng cache chart
+  REDIS_URL: ""
